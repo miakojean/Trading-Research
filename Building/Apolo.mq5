@@ -8,6 +8,13 @@
 #property version   "1.00"
 
 //+------------------------------------------------------------------+
+//|  variables globales                                              |
+//+------------------------------------------------------------------+
+// Identifiants pour les objets graphiques du range
+#define OBJ_RANGE_RESISTANCE "RangeResistanceLine"
+#define OBJ_RANGE_SUPPORT    "RangeSupportLine"
+
+//+------------------------------------------------------------------+
 //| Input parameters                                                 |
 //+------------------------------------------------------------------+
 input double LotSize        = 0.5;      // Taille du lot
@@ -29,6 +36,7 @@ int rsiHandle;
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
+#include <Arrays\ArrayObj.mqh> // Pour utiliser CArrayObj
 CTrade trade;
 CPositionInfo position;
 
@@ -113,6 +121,9 @@ void OnTick()
    }
 
    SystemSignals();
+   // Gérer les Stop Loss des positions existantes
+   ManageStopLoss(); // <--- Appelez votre nouvelle fonction ici
+   IsMarketRangingRelativeAmplitude();
 
    double capital = AccountInfoDouble(ACCOUNT_BALANCE);
    Print("Solde actuel du compte : ", capital);
@@ -194,6 +205,8 @@ string GetSignal()
    return "ERROR"; // Retourne "ERROR" en cas de problème
 }
 
+// Get KumoPosition
+
 string GetKumoPosition()
 {
    double senkouSpanA[], senkouSpanB[], price;
@@ -231,6 +244,64 @@ string GetKumoPosition()
    return "ERROR";
 }
 
+//+------------------------------------------------------------------+
+//| Détecte un range basé sur l'amplitude relative à la moyenne      |
+//+------------------------------------------------------------------+
+bool IsMarketRangingRelativeAmplitude()
+{
+    // Paramètres
+    int    InpRangeLookbackBars = 50;     // Barres pour analyser le range actuel
+    int    InpHistoricalBars = 200;       // Barres pour calculer l'amplitude historique
+    double InpRangeAmplitudeRatio = 0.1;  // Ratio max (50%) entre amplitude actuelle et historique
+    
+    Print("===== Début analyse IsMarketRangingRelativeAmplitude =====");
+    Print("Paramètres: Lookback=", InpRangeLookbackBars, " bars, HistoricalBars=", InpHistoricalBars, ", RatioMax=", InpRangeAmplitudeRatio*100, "%");
+
+    // Vérification des données disponibles
+    int availableBars = Bars(_Symbol, _Period);
+    if (availableBars < InpHistoricalBars)
+    {
+        Print("Échec: Seulement ", availableBars, " barres disponibles (", InpHistoricalBars, " requises)");
+        Print("===== Fin analyse (FALSE) =====");
+        return false;
+    }
+    Print("Barres disponibles: ", availableBars, " (OK)");
+
+    // 1. Calcul de l'amplitude actuelle
+    double currentHigh = iHighest(_Symbol, _Period, MODE_HIGH, InpRangeLookbackBars, 0);
+    double currentLow = iLowest(_Symbol, _Period, MODE_LOW, InpRangeLookbackBars, 0);
+    double currentAmplitude = currentHigh - currentLow;
+    Print("Amplitude actuelle (", InpRangeLookbackBars, " barres): ", currentAmplitude);
+
+    // 2. Calcul de l'amplitude historique moyenne
+    double historicalAmplitudeSum = 0;
+    for(int i = 0; i < InpHistoricalBars; i++)
+    {
+        double barHigh = iHigh(_Symbol, _Period, i);
+        double barLow = iLow(_Symbol, _Period, i);
+        historicalAmplitudeSum += (barHigh - barLow);
+    }
+    double avgHistoricalAmplitude = historicalAmplitudeSum / InpHistoricalBars;
+    Print("Amplitude historique moyenne (", InpHistoricalBars, " barres): ", avgHistoricalAmplitude);
+
+    // 3. Calcul du ratio amplitude actuelle/historique
+    double amplitudeRatio = currentAmplitude / avgHistoricalAmplitude;
+    Print("Ratio amplitude actuelle/historique: ", amplitudeRatio*100, "%");
+
+    // Condition: le ratio doit être <= 50%
+    if(amplitudeRatio <= InpRangeAmplitudeRatio)
+    {
+        Print("Condition RANGE: VRAI (Ratio ", amplitudeRatio*100, "% <= ", InpRangeAmplitudeRatio*100, "%)");
+        Print("===== Fin analyse (TRUE) =====");
+        return true;
+    }
+    else
+    {
+        Print("Condition RANGE: FAUX (Ratio ", amplitudeRatio*100, "% > ", InpRangeAmplitudeRatio*100, "%)");
+        Print("===== Fin analyse (FALSE) =====");
+        return false;
+    }
+}
 
 //+------------------------------------------------------------------+
 //| Les différents signaux du système de tradding                    |
@@ -306,7 +377,8 @@ void SystemSignals()
     else if(ha_close_buffer[0] < ha_open_buffer[0] && 
         ha_close_buffer[1] < ha_open_buffer[1] && 
         ha_close_buffer[2] < ha_open_buffer[2] &&
-        signal == "SELL" && rsiSignal == "NEUTRAL" && isAsianSession == false)
+        signal == "SELL" && rsiSignal == "NEUTRAL" && isAsianSession == false
+        )
     {
         Print("🔻 Signal VENTE - Deux bougies rouges consécutives");
         
@@ -408,131 +480,208 @@ void OpenSellPosition()
 /* La gestion du risque; partie la plus importante de notre système */
 
 //+------------------------------------------------------------------+
-//| Gestion dynamique de la taille de position                       |
+//| Gestion simple de la taille de position                          |
 //+------------------------------------------------------------------+
 double AdjustLotSize()
 {
-    // Taille du lot par défaut, utilisée si aucune condition d'ajustement spécifique n'est remplie
-    double calculatedLotSize = LotSize; 
+    // Obtenir les contraintes de volume du courtier pour le symbole actuel
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
     
-    // Obtenir la marge libre disponible sur le compte
-    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+    double ReduceLossFactor = 2.0; // Facteur de réduction si la dernière position était perdante (par défaut 2x moins)
 
-    // Récupérer les signaux Ichimoku et la position par rapport au nuage
+    // --- Étape 1 : Valider et normaliser la LotSize d'entrée ---
+    double baseValidatedLot = LotSize;
+    baseValidatedLot = MathMax(baseValidatedLot, minLot);
+    baseValidatedLot = MathMin(baseValidatedLot, maxLot);
+    baseValidatedLot = NormalizeDouble(baseValidatedLot / stepLot, 0) * stepLot;
+
+    // Cette variable contiendra la taille de lot finale
+    double finalLotSize = baseValidatedLot; 
+    
+    // Obtenir les signaux Ichimoku et la position par rapport au nuage
     string signal = GetSignal();
     string kumoPosition = GetKumoPosition();
     
-    // Déterminer le type d'ordre et le prix pour le calcul de marge
-    // Cette partie doit être robuste même si les signaux ne sont pas BUY/SELL
+    // Déterminer le type d'ordre pour la condition de doublement
     ENUM_ORDER_TYPE orderType;
-    double price;
-    
     if (signal == "BUY")
     {
         orderType = ORDER_TYPE_BUY;
-        price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
     }
     else if (signal == "SELL")
     {
         orderType = ORDER_TYPE_SELL;
-        price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
     }
     else
     {
-        // Si le signal est neutre ou erreur, on ne peut pas calculer la marge pour une nouvelle transaction,
-        // donc on s'en tient au lot par défaut.
-        Print("ℹ️ Signal Ichimoku neutre ou erreur, pas de calcul de lot dynamique avancé. Utilisation du LotSize par défaut.");
-        return calculatedLotSize; 
+        Print("ℹ️ Signal Ichimoku neutre ou erreur. Utilisation de la LotSize de base validée : ", finalLotSize);
+        return finalLotSize; 
     }
 
-    double marginRequiredForOneLot;
-    // Calculer la marge requise pour 1.0 lot. Vérifier si le calcul réussit.
-    if (!OrderCalcMargin(orderType, _Symbol, 1.0, price, marginRequiredForOneLot))
+    // --- Vérifier si la dernière position était perdante et ajuster le lot en conséquence ---
+    if (WasLastPositionLoss())
     {
-        Print("❌ Erreur lors du calcul de la marge requise pour 1.0 lot : ", GetLastError(), ". Utilisation du LotSize par défaut.");
-        return calculatedLotSize; // Retourne le lot par défaut en cas d'échec du calcul
+        // Réduire le lot de base par le facteur de réduction (par exemple, diviser par 2)
+        finalLotSize = baseValidatedLot / ReduceLossFactor;
+        Print("📉 La dernière position était perdante. Réduction du lot à : ", finalLotSize);
     }
-    
-    // --- Logique de gestion du risque dynamique ---
-
-    // Option 1: Doublement du lot si les conditions du nuage Ichimoku sont très favorables
-    // Ceci peut être appliqué à la première position si l'on veut être plus agressif dès le début.
-    bool canDoubleLot = false;
-    if ((orderType == ORDER_TYPE_BUY && kumoPosition == "ABOVE_CLOUD") || 
-        (orderType == ORDER_TYPE_SELL && kumoPosition == "BELOW_CLOUD"))
+    // Si la dernière position n'était PAS perdante, on peut envisager le doublement.
+    // NOTE : Si vous voulez que la réduction annule le doublement, ou que le doublement annule la réduction,
+    // l'ordre de ces blocs 'if' est important. Ici, la réduction prime sur le doublement.
+    else 
     {
-        canDoubleLot = true;
-    }
-    
-    if (canDoubleLot)
-    {
-        // On vise à utiliser un certain pourcentage de la marge libre pour le lot doublé
-        // Par exemple, 5% du solde du compte ou un pourcentage de la marge libre.
-        // Ici, nous allons calculer un lot maximum basé sur un pourcentage de la marge libre disponible.
-        // C'est plus sûr que de simplement doubler le lot sans vérification de la marge.
-        
-        // Pourcentage de marge libre que nous sommes prêts à risquer pour cette position (ex: 10%)
-        // Ajustez cette valeur selon votre tolérance au risque.
-        double percentageOfFreeMarginToUse = 0.10; 
-        
-        // Lot maximal que l'on peut ouvrir avec ce pourcentage de marge libre
-        double maxAllowedLotBasedOnMargin = (freeMargin * percentageOfFreeMarginToUse) / marginRequiredForOneLot;
-        
-        // Limiter le lot minimum, maximum et les pas du symbole
-        double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-        double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-        double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-
-        // Calculer le lot doublé potentiel (si une position existe déjà et qu'on voulait doubler)
-        // Sinon, c'est simplement LotSize * 2.0 pour la première position si canDoubleLot est vrai
-        double proposedLot = LotSize * 2.0; // Point de départ pour le lot "doublé"
-
-        // Vérifier si une position existe déjà et ajuster le 'proposedLot' en conséquence
-        if (PositionSelect(_Symbol))
+        // --- Logique de doublement du lot si les conditions du Kumo sont remplies ---
+        bool shouldDoubleLot = false;
+        if ((orderType == ORDER_TYPE_BUY && kumoPosition == "ABOVE_CLOUD") || 
+            (orderType == ORDER_TYPE_SELL && kumoPosition == "BELOW_CLOUD"))
         {
-             double currentLot = PositionGetDouble(POSITION_VOLUME);
-             // Si on veut vraiment doubler une position existante
-             proposedLot = currentLot * 2.0; 
+            shouldDoubleLot = true;
         }
 
-        // Le lot final sera le minimum entre le lot proposé (doublé ou LotSize*2),
-        // le lot maximal autorisé par la marge et le lot maximum du symbole.
-        calculatedLotSize = MathMin(proposedLot, maxAllowedLotBasedOnMargin);
-        calculatedLotSize = MathMin(calculatedLotSize, maxLot); // S'assurer de ne pas dépasser le lot max du symbole
-        calculatedLotSize = MathMax(calculatedLotSize, minLot); // S'assurer de ne pas être en dessous du lot min
-
-        // Normaliser le lot à l'étape de volume du symbole
-        calculatedLotSize = NormalizeDouble(calculatedLotSize / stepLot, 0) * stepLot;
-
-        Print("🚀 Lot dynamique calculé : ", calculatedLotSize, " (basé sur le signal et la marge).");
+        if (shouldDoubleLot)
+        {
+            // Doubler la taille de lot de base (non réduite)
+            finalLotSize = baseValidatedLot * 2.0;
+            Print("🚀 Doublé la taille de lot de base en raison de la position favorable du nuage Ichimoku.");
+        }
+        else
+        {
+            // Si aucune condition spéciale, on garde la taille de lot de base
+            Print("ℹ️ Utilisation de la taille de lot de base.");
+        }
     }
-    else
+
+    // --- Valider et normaliser la taille de lot finale ---
+    finalLotSize = MathMax(finalLotSize, minLot); // Ne pas être inférieur au min
+    finalLotSize = MathMin(finalLotSize, maxLot); // Ne pas être supérieur au max
+    finalLotSize = NormalizeDouble(finalLotSize / stepLot, 0) * stepLot;
+
+    // --- Vérification finale ---
+    if (finalLotSize <= 0)
     {
-        // Si les conditions de doublement ne sont pas remplies, ou si c'est la première position sans conditions spéciales,
-        // on utilise le LotSize par défaut.
-        calculatedLotSize = LotSize;
-
-        // Assurez-vous que le LotSize par défaut est également valide
-        double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-        double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-        double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-        
-        calculatedLotSize = MathMax(calculatedLotSize, minLot);
-        calculatedLotSize = MathMin(calculatedLotSize, maxLot);
-        calculatedLotSize = NormalizeDouble(calculatedLotSize / stepLot, 0) * stepLot;
-
-        Print("ℹ️ Utilisation du LotSize par défaut : ", calculatedLotSize);
+        Print("⚠️ La taille de lot finale est nulle ou négative après ajustements. Retourne le volume minimum autorisé ou 0.1.");
+        return MathMax(minLot, 0.1); 
     }
 
-    // Vérification finale pour s'assurer que le lot n'est pas zéro ou négatif.
-    if (calculatedLotSize <= 0)
-    {
-        Print("⚠️ Le calcul du lot a résulté en une valeur invalide (<= 0). Retourne le LotSize par défaut.");
-        return LotSize; // Fallback au LotSize d'entrée si le calcul a foiré.
-    }
-
-    return calculatedLotSize;
+    Print("✅ Taille de lot finale déterminée : ", finalLotSize);
+    return finalLotSize;
 }
+
+//+------------------------------------------------------------------------------+
+//| Nouvelle fonction pour vérifier le résultat de la dernière position clôturée |
+//+------------------------------------------------------------------------------+
+bool WasLastPositionLoss()
+{
+    // Sélectionner toutes les positions dans l'historique pour le symbole actuel et le Magic Number
+    // et trier par heure de clôture descendante
+    HistorySelect(0, TimeCurrent());
+    
+    for (int i = HistoryDealsTotal() - 1; i >= 0; i--)
+    {
+        ulong deal_ticket = HistoryDealGetTicket(i);
+        if (deal_ticket == 0) continue;
+
+        if (HistoryDealGetString(deal_ticket, DEAL_SYMBOL) == _Symbol &&
+            HistoryDealGetInteger(deal_ticket, DEAL_MAGIC) == MagicNumber &&
+            HistoryDealGetInteger(deal_ticket, DEAL_ENTRY) == DEAL_ENTRY_OUT) // C'est une sortie de position (clôture)
+        {
+            double profit = HistoryDealGetDouble(deal_ticket, DEAL_PROFIT);
+            if (profit < 0)
+            {
+                // La dernière position clôturée pour cet EA/symbole était une perte
+                Print("🔍 Dernière position clôturée pour ", _Symbol, " (Magic: ", MagicNumber, ") était une PERTE (Profit: ", profit, ").");
+                return true;
+            }
+            else
+            {
+                // La dernière position clôturée était un gain ou un point mort.
+                Print("🔍 Dernière position clôturée pour ", _Symbol, " (Magic: ", MagicNumber, ") était un GAIN/Point Mort (Profit: ", profit, ").");
+                return false; // On a trouvé une position, et elle n'était pas perdante
+            }
+        }
+    }
+    // Si aucune position clôturée n'est trouvée pour cet EA/symbole, on considère que la dernière n'était pas perdante.
+    // Ou vous pouvez choisir de retourner false et de ne pas réduire le lot par défaut.
+    Print("🔍 Aucune position clôturée trouvée pour ", _Symbol, " (Magic: ", MagicNumber, ").");
+    return false; 
+}
+
+//+------------------------------------------------------------------+
+//| Gère le Stop Loss des positions ouvertes                         |
+//+------------------------------------------------------------------+
+void ManageStopLoss()
+{
+    // Itérer sur toutes les positions du compte
+    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        // Sélectionner la position par index
+        if (position.SelectByIndex(i))
+        {
+            // Vérifier si la position appartient à cet EA et à ce symbole
+            if (position.Symbol() == _Symbol && position.Magic() == MagicNumber)
+            {
+                double currentSL = position.StopLoss(); // Stop Loss actuel de la position
+                double entryPrice = position.PriceOpen(); // Prix d'ouverture de la position
+                double currentProfit = position.Profit(); // Profit/Perte actuel de la position
+                double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+                double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+                double newSL = -3000; // Nouvelle valeur du Stop Loss à calculer
+
+                // --- Logique de gestion du Stop Loss ---
+
+                // Exemple 1 : Remonter le Stop Loss au point mort (Break-even)
+                // Si le profit dépasse X points, remonte le SL au prix d'entrée + un petit surplus pour les frais
+                int breakEvenPoints = 10000; // Par exemple, 500 points de profit pour activer le Break-even
+                int breakEvenBufferPoints = 10; // Marge pour couvrir le spread/commission
+
+                if (position.PositionType() == POSITION_TYPE_BUY)
+                {
+                    if (bid > entryPrice + breakEvenPoints * point) // Si la position est en profit suffisant
+                    {
+                        newSL = entryPrice + breakEvenBufferPoints * point;
+                        // Assurez-vous que le nouveau SL n'est pas pire que l'actuel et qu'il est supérieur au prix d'entrée
+                        if (newSL > currentSL || currentSL == 0) // currentSL == 0 signifie pas de SL défini initialement
+                        {
+                            if (trade.PositionModify(position.Ticket(), newSL, position.TakeProfit()))
+                            {
+                                Print("✅ SL d'achat ajusté au point mort pour le ticket #", position.Ticket(), ". Nouveau SL: ", newSL);
+                            }
+                            else
+                            {
+                                Print("❌ Échec de l'ajustement du SL d'achat pour le ticket #", position.Ticket(), ": ", GetLastError());
+                            }
+                        }
+                    }
+                }
+                else if (position.PositionType() == POSITION_TYPE_SELL)
+                {
+                    if (ask < entryPrice - breakEvenPoints * point) // Si la position est en profit suffisant
+                    {
+                        newSL = entryPrice - breakEvenBufferPoints * point;
+                        // Assurez-vous que le nouveau SL n'est pas pire que l'actuel et qu'il est inférieur au prix d'entrée
+                        if (newSL < currentSL || currentSL == 0)
+                        {
+                            if (trade.PositionModify(position.Ticket(), newSL, position.TakeProfit()))
+                            {
+                                Print("✅ SL de vente ajusté au point mort pour le ticket #", position.Ticket(), ". Nouveau SL: ", newSL);
+                            }
+                            else
+                            {
+                                Print("❌ Échec de l'ajustement du SL de vente pour le ticket #", position.Ticket(), ": ", GetLastError());
+                            }
+                        }
+                    }
+                }
+                
+            }
+        }
+    }
+}
+
 
 /* Eviter les expositions inutiles du capital */
 
