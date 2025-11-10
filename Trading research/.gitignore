@@ -1,0 +1,76 @@
+# Environnement Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+pip-selfcheck.json
+.Python
+pyvenv.cfg
+
+# Fichiers de dépendances
+*.egg
+*.egg-info
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# Fichiers de configuration et IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+.DS_Store
+*.code-workspace
+
+# Fichiers de données et exports
+*.xlsx
+*.xls
+*.csv
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.html
+*.htm
+*.pdf
+*.log
+
+# Fichiers de cache et temporaires
+*.tmp
+*.bak
+*.cache
+*.class
+*.log
+*.pot
+*.pyc
+*.pyd
+*.pyo
+*.mo
+*.db
+*.sqlite
+*.spec
+
+# Fichiers de test et coverage
+.coverage
+htmlcov/
+.tox/
+.nox/
+*.cover
+.hypothesis/
+.pytest_cache/
+*.zip

@@ -1,0 +1,16 @@
+# --- Core Python data science stack ---
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.5.0
+matplotlib>=3.9.0
+seaborn>=0.13.0
+
+# --- Deep learning (choisis un des deux selon ton framework préféré) ---
+tensorflow>=2.16.0        # Pour Keras / LSTM / GRU
+# torch>=2.3.0             # (Décommente si tu veux utiliser PyTorch à la place)
+
+# --- Utilitaires et expérimentations ---
+tqdm>=4.66.0               # Barre de progression
+joblib>=1.4.0              # Sauvegarde de modèles/scalers
+yfinance>=0.2.40           # Si jamais tu veux comparer avec des données Yahoo
+python-dateutil>=2.9.0
